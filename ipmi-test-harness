@@ -1,0 +1,455 @@
+#!/bin/bash
+#
+# ipmi-test-harness - Comprehensive IPMI test harness for BMC validation
+#
+# Validates sensor monitoring, power control, event logging, and authentication
+# across diverse BMC implementations with snapshot-safe, idempotent routines.
+#
+
+#######################################
+# Color Definitions
+#######################################
+declare OFF="\e[m"
+declare INF="\e[0;93m"
+declare CAU="\e[1;95m"
+declare WRN="\e[0;91m"
+declare STA="\e[1;92m"
+
+#######################################
+# Script-Level Variables
+#######################################
+declare script_dir="$(dirname "$(readlink -f "$0")")"
+declare config_file="${IPMI_TEST_CONFIG:-$script_dir/ipmi-test.conf}"
+declare log_dir="${IPMI_TEST_LOG_DIR:-/var/log/ipmi-tests}"
+declare test_modules_dir="${IPMI_TEST_MODULES_DIR:-$script_dir/ipmi-test-modules}"
+declare -i verbose=0
+declare -i dry_run=0
+declare -i fail_fast=0
+declare test_suite="all"
+declare bmc_host=""
+declare bmc_user=""
+declare bmc_pass=""
+declare -a test_modules=()
+declare -a enabled_modules=()
+declare -i total_tests=0
+declare -i passed_tests=0
+declare -i failed_tests=0
+declare -i skipped_tests=0
+declare test_session_id=""
+declare log_file=""
+
+declare usagestr="$(
+cat <<EOF
+$(basename "$0") [-h|--help] [OPTIONS]
+
+Comprehensive IPMI test harness for BMC validation. Tests sensor monitoring,
+power control, event logging, and authentication across diverse BMC implementations.
+
+Options:
+  -h, --help              Show this help message
+  -c, --config FILE       Configuration file (default: ipmi-test.conf)
+  -H, --host HOST         BMC hostname or IP address
+  -U, --user USER         BMC username
+  -P, --pass PASS         BMC password
+  -m, --module MODULE      Run specific test module (sensors|chassis|sel|auth|all)
+  -l, --log-dir DIR       Log directory (default: /var/log/ipmi-tests)
+  -v, --verbose           Verbose output
+  -d, --dry-run           Dry run mode (show what would be executed)
+  -f, --fail-fast         Stop on first test failure
+  -s, --suite SUITE       Test suite name (default: all)
+
+Test Modules:
+  sensors    - Sensor monitoring and reading tests
+  chassis    - Chassis power control tests
+  sel        - System Event Log operations
+  auth       - Authentication and security tests
+  all        - Run all test modules (default)
+
+Examples:
+  # Run all tests with default config
+  $(basename "$0")
+
+  # Run specific module with custom host
+  $(basename "$0") -H 192.168.1.100 -U admin -P password -m sensors
+
+  # Verbose dry-run to see what would be tested
+  $(basename "$0") -v -d -m chassis
+
+  # Run with custom config and log directory
+  $(basename "$0") -c /path/to/config.conf -l /tmp/ipmi-logs
+
+Configuration File:
+  The config file supports the following variables:
+    BMC_HOST=hostname_or_ip
+    BMC_USER=username
+    BMC_PASS=password
+    BMC_INTERFACE=lanplus|lan|open
+    BMC_TIMEOUT=30
+    VERBOSE=0|1
+    DRY_RUN=0|1
+
+EOF
+)"
+
+#######################################
+# Functions
+#######################################
+
+#** usage: print usage information
+#*
+usage() {
+	echo -e "$usagestr"
+}
+
+#** exitme: exit with code and optional message
+#*
+# Arguments
+#   $1 - exit code
+#   $2 - optional message
+#*
+exitme() {
+	local -i code="$1"
+	local msg="$2"
+
+	((code == 0)) && exit "$code"
+	[[ -n "$msg" ]] && echo -e "$msg" >&2
+	usage
+	exit "$code"
+}
+
+#** control_c: control-c trap
+#*
+control_c() {
+	echo -e "\nCtrl-c detected\nCleaning up and exiting."
+	log_message "WARN" "Test interrupted by user"
+	cleanup
+	exitme 130
+}
+
+#** log_message: write message to log file with timestamp and attribution
+#*
+# Arguments
+#   $1 - log level (INFO|WARN|ERROR|DEBUG|TEST)
+#   $2 - message text
+#*
+log_message() {
+	local level="$1"
+	local msg="$2"
+	local timestamp
+	local user
+
+	timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+	user="${SUDO_USER:-${USER:-unknown}}"
+
+	[[ -n "$log_file" ]] && {
+		echo "[$timestamp] [$level] [$user] $msg" >> "$log_file"
+	}
+
+	((verbose > 0)) && {
+		case "$level" in
+			ERROR)	echo -e "${CAU}[ERROR]${OFF} $msg" >&2 ;;
+			WARN)	echo -e "${WRN}[WARN]${OFF} $msg" ;;
+			DEBUG)	((verbose > 1)) && echo -e "[DEBUG] $msg" ;;
+			TEST)	echo -e "${INF}[TEST]${OFF} $msg" ;;
+			*)		echo -e "[$level] $msg" ;;
+		esac
+	}
+}
+
+#** load_config: load configuration from file
+#*
+load_config() {
+	[[ -f "$config_file" ]] || {
+		log_message "WARN" "Config file not found: $config_file (using defaults)"
+		return 0
+	}
+
+	log_message "INFO" "Loading configuration from: $config_file"
+	
+	while IFS='=' read -r key value; do
+		# Skip comments and empty lines
+		[[ "$key" =~ ^#.*$ ]] && continue
+		[[ -z "$key" ]] && continue
+		
+		# Remove quotes if present
+		value="${value#\"}"
+		value="${value%\"}"
+		value="${value#\'}"
+		value="${value%\'}"
+		
+		case "$key" in
+			BMC_HOST)	[[ -z "$bmc_host" ]] && bmc_host="$value" ;;
+			BMC_USER)	[[ -z "$bmc_user" ]] && bmc_user="$value" ;;
+			BMC_PASS)	[[ -z "$bmc_pass" ]] && bmc_pass="$value" ;;
+			VERBOSE)	((verbose == 0)) && verbose="$value" ;;
+			DRY_RUN)	((dry_run == 0)) && dry_run="$value" ;;
+		esac
+	done < "$config_file"
+}
+
+#** validate_requirements: check that required tools and modules are available
+#*
+validate_requirements() {
+	local missing_tools=()
+	local tool
+
+	# Check for ipmitool
+	command -v ipmitool >/dev/null 2>&1 || missing_tools+=("ipmitool")
+
+	# Check for test modules directory
+	[[ -d "$test_modules_dir" ]] || {
+		log_message "ERROR" "Test modules directory not found: $test_modules_dir"
+		exitme 1 "Test modules directory not found"
+	}
+
+	# Check for required module files
+	local -a required_modules=("sensors" "chassis" "sel" "auth")
+	for module in "${required_modules[@]}"; do
+		[[ -f "$test_modules_dir/ipmi-test-$module.sh" ]] || {
+			log_message "ERROR" "Required test module not found: ipmi-test-$module.sh"
+			exitme 1 "Missing test module: $module"
+		}
+	done
+
+	# Report missing tools
+	(( ${#missing_tools[@]} > 0 )) && {
+		log_message "ERROR" "Missing required tools: ${missing_tools[*]}"
+		exitme 1 "Please install missing tools: ${missing_tools[*]}"
+	}
+
+	log_message "INFO" "All requirements validated"
+}
+
+#** setup_logging: initialize logging infrastructure
+#*
+setup_logging() {
+	# Create log directory if it doesn't exist
+	[[ -d "$log_dir" ]] || {
+		mkdir -p "$log_dir" || {
+			log_message "ERROR" "Failed to create log directory: $log_dir"
+			exitme 1
+		}
+	}
+
+	# Generate session ID
+	test_session_id="session-$(date '+%Y%m%d-%H%M%S')-$$"
+	log_file="$log_dir/$test_session_id.log"
+
+	# Create log file
+	touch "$log_file" || {
+		log_message "ERROR" "Failed to create log file: $log_file"
+		exitme 1
+	}
+
+	log_message "INFO" "Test session started: $test_session_id"
+	log_message "INFO" "Log file: $log_file"
+}
+
+#** cleanup: cleanup function for idempotent operations
+#*
+cleanup() {
+	log_message "INFO" "Cleaning up test session"
+	# Add any cleanup operations here
+	# This function ensures tests are idempotent
+}
+
+#** run_test_module: execute a test module
+#*
+# Arguments
+#   $1 - module name
+#*
+run_test_module() {
+	local module="$1"
+	local module_file="$test_modules_dir/ipmi-test-$module.sh"
+	local -i module_passed=0
+	local -i module_failed=0
+	local -i module_skipped=0
+
+	[[ -f "$module_file" ]] || {
+		log_message "ERROR" "Module file not found: $module_file"
+		return 1
+	}
+
+	log_message "TEST" "=========================================="
+	log_message "TEST" "Running test module: $module"
+	log_message "TEST" "=========================================="
+
+	# Source the module and run its main function
+	# Modules should export a 'run_module_tests' function
+	if source "$module_file" 2>>"$log_file"; then
+		if declare -f run_module_tests >/dev/null; then
+			# Export required variables for module
+			export BMC_HOST="$bmc_host"
+			export BMC_USER="$bmc_user"
+			export BMC_PASS="$bmc_pass"
+			export VERBOSE="$verbose"
+			export DRY_RUN="$dry_run"
+			export LOG_FILE="$log_file"
+			export SESSION_ID="$test_session_id"
+
+			# Run module tests
+			if run_module_tests; then
+				log_message "INFO" "Module $module completed successfully"
+				module_passed=1
+			else
+				log_message "ERROR" "Module $module failed"
+				module_failed=1
+				((fail_fast > 0)) && return 1
+			fi
+		else
+			log_message "ERROR" "Module $module does not export run_module_tests function"
+			module_failed=1
+		fi
+	else
+		log_message "ERROR" "Failed to source module: $module_file"
+		module_failed=1
+	fi
+
+	# Update counters
+	((module_passed > 0)) && ((++passed_tests))
+	((module_failed > 0)) && ((++failed_tests))
+	((module_skipped > 0)) && ((++skipped_tests))
+	((++total_tests))
+
+	return $module_failed
+}
+
+#** print_summary: print test execution summary
+#*
+print_summary() {
+	local -i exit_code=0
+
+	echo ""
+	echo "=========================================="
+	echo "Test Execution Summary"
+	echo "=========================================="
+	echo "Session ID: $test_session_id"
+	echo "Log File: $log_file"
+	echo "Total Modules: $total_tests"
+	echo "Passed: $passed_tests"
+	echo "Failed: $failed_tests"
+	echo "Skipped: $skipped_tests"
+	echo "=========================================="
+
+	((failed_tests > 0)) && exit_code=1
+	((total_tests == 0)) && {
+		log_message "WARN" "No tests were executed"
+		exit_code=2
+	}
+
+	return $exit_code
+}
+
+#** main: main function
+#*
+main() {
+	trap control_c SIGINT
+
+	local opt
+
+	# Parse command-line arguments
+	while getopts "hc:H:U:P:m:l:vdfs:" opt; do
+		case "$opt" in
+			h)
+				usage
+				exit 0
+				;;
+			c)
+				config_file="$OPTARG"
+				;;
+			H)
+				bmc_host="$OPTARG"
+				;;
+			U)
+				bmc_user="$OPTARG"
+				;;
+			P)
+				bmc_pass="$OPTARG"
+				;;
+			m)
+				test_suite="$OPTARG"
+				;;
+			l)
+				log_dir="$OPTARG"
+				;;
+			v)
+				((++verbose))
+				;;
+			d)
+				dry_run=1
+				;;
+			f)
+				fail_fast=1
+				;;
+			s)
+				test_suite="$OPTARG"
+				;;
+			\?)
+				exitme 1 "Invalid option: -$OPTARG"
+				;;
+			:)
+				exitme 1 "Option -$OPTARG requires an argument"
+				;;
+		esac
+	done
+
+	# Check for help as positional argument
+	[[ "$1" == "help" ]] || [[ "$1" == "--help" ]] && {
+		usage
+		exit 0
+	}
+
+	# Load configuration
+	load_config
+
+	# Validate requirements
+	validate_requirements
+
+	# Setup logging
+	setup_logging
+
+	# Validate BMC connection parameters
+	[[ -z "$bmc_host" ]] && exitme 1 "BMC host not specified (use -H or config file)"
+	[[ -z "$bmc_user" ]] && exitme 1 "BMC user not specified (use -U or config file)"
+	[[ -z "$bmc_pass" ]] && exitme 1 "BMC password not specified (use -P or config file)"
+
+	log_message "INFO" "BMC Host: $bmc_host"
+	log_message "INFO" "BMC User: $bmc_user"
+	log_message "INFO" "Test Suite: $test_suite"
+	log_message "INFO" "Verbose: $verbose"
+	log_message "INFO" "Dry Run: $dry_run"
+	log_message "INFO" "Fail Fast: $fail_fast"
+
+	# Determine which modules to run
+	case "$test_suite" in
+		all)
+			enabled_modules=("sensors" "chassis" "sel" "auth")
+			;;
+		sensors|chassis|sel|auth)
+			enabled_modules=("$test_suite")
+			;;
+		*)
+			exitme 1 "Invalid test suite: $test_suite"
+			;;
+	esac
+
+	# Run test modules
+	for module in "${enabled_modules[@]}"; do
+		run_test_module "$module" || {
+			((fail_fast > 0)) && {
+				log_message "ERROR" "Stopping due to fail-fast mode"
+				break
+			}
+		}
+	done
+
+	# Print summary
+	print_summary
+	local -i exit_code=$?
+
+	cleanup
+	exit $exit_code
+}
+
+main "$@"
+

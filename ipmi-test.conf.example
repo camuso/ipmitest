@@ -1,0 +1,29 @@
+# IPMI Test Harness Configuration File
+#
+# Copy this file to ipmi-test.conf and customize for your environment
+#
+
+# BMC Connection Parameters
+BMC_HOST="192.168.1.100"
+BMC_USER="admin"
+BMC_PASS="password"
+
+# IPMI Interface (lanplus, lan, open)
+BMC_INTERFACE="lanplus"
+
+# Timeout in seconds
+BMC_TIMEOUT=30
+
+# Verbose output (0=quiet, 1=normal, 2=debug)
+VERBOSE=1
+
+# Dry run mode (0=execute, 1=dry-run)
+DRY_RUN=0
+
+# Test Configuration
+# Test modules to run: sensors, chassis, sel, auth, or all
+TEST_SUITE="all"
+
+# Log directory
+LOG_DIR="/var/log/ipmi-tests"
+
