@@ -62,23 +62,66 @@ log_test() {
 	esac
 }
 
+#** show_spinner: display spinner while command runs
+#*
+# Arguments
+#   $1 - PID of background process to wait for
+#*
+show_spinner() {
+	local -i pid=$1
+	local spinner_chars='|/-\'
+	local -i i=0
+	
+	# Only show spinner if not in verbose mode
+	((VERBOSE > 0)) && return 0
+	
+	while kill -0 "$pid" 2>/dev/null; do
+		printf "\r[%c] " "${spinner_chars:i++%4:1}"
+		sleep 0.1
+	done
+	printf "\r"
+}
+
 #** run_ipmi_cmd: execute IPMI command with error handling
 #*
 run_ipmi_cmd() {
 	local cmd_output
 	local -i cmd_status
+	local temp_file
 
 	((DRY_RUN > 0)) && {
 		echo "[DRY-RUN] ipmitool $*" >&2
 		return 0
 	}
 
-	cmd_output=$(ipmitool -I lanplus -H "$BMC_HOST" -U "$BMC_USER" -P "$BMC_PASS" "$@" 2>&1)
-	cmd_status=$?
+	# Build ipmitool command based on local or remote mode
+	if ((LOCAL_MODE > 0)); then
+		# Local mode: use -I open, no host/user/pass
+		temp_file=$(mktemp)
+		ipmitool -I "${BMC_INTERFACE:-open}" "$@" >"$temp_file" 2>&1 &
+		local -i bg_pid=$!
+		show_spinner $bg_pid
+		wait $bg_pid
+		cmd_status=$?
+		cmd_output=$(cat "$temp_file")
+		rm -f "$temp_file"
+	else
+		# Remote mode: use network parameters
+		temp_file=$(mktemp)
+		ipmitool -I "${BMC_INTERFACE:-lanplus}" -H "$BMC_HOST" -U "$BMC_USER" -P "$BMC_PASS" "$@" >"$temp_file" 2>&1 &
+		local -i bg_pid=$!
+		show_spinner $bg_pid
+		wait $bg_pid
+		cmd_status=$?
+		cmd_output=$(cat "$temp_file")
+		rm -f "$temp_file"
+	fi
 
 	((VERBOSE > 1)) && echo "Command: ipmitool $*" >&2
 	((VERBOSE > 1)) && echo "Output: $cmd_output" >&2
 
+	# Echo output so callers can capture it
+	echo "$cmd_output"
 	return $cmd_status
 }
 
@@ -183,6 +226,11 @@ test_power_cycle() {
 		return 0
 	}
 
+	((ALLOW_DESTRUCTIVE == 0)) && {
+		log_test "$test_name" "SKIP" "Skipped (use -D/--allow-destructive to enable)"
+		return 0
+	}
+
 	log_test "$test_name" "INFO" "Testing power cycle command"
 
 	initial_state=$(get_power_state)
@@ -217,6 +265,11 @@ test_power_reset() {
 		return 0
 	}
 
+	((ALLOW_DESTRUCTIVE == 0)) && {
+		log_test "$test_name" "SKIP" "Skipped (use -D/--allow-destructive to enable)"
+		return 0
+	}
+
 	log_test "$test_name" "INFO" "Testing power reset command"
 
 	initial_state=$(get_power_state)
@@ -245,6 +298,11 @@ test_power_soft() {
 
 	((DRY_RUN > 0)) && {
 		log_test "$test_name" "SKIP" "Skipped in dry-run mode (destructive operation)"
+		return 0
+	}
+
+	((ALLOW_DESTRUCTIVE == 0)) && {
+		log_test "$test_name" "SKIP" "Skipped (use -D/--allow-destructive to enable)"
 		return 0
 	}
 

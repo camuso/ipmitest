@@ -19,9 +19,29 @@ declare STA="\e[1;92m"
 # Script-Level Variables
 #######################################
 declare script_dir="$(dirname "$(readlink -f "$0")")"
-declare config_file="${IPMI_TEST_CONFIG:-$script_dir/ipmi-test.conf}"
-declare log_dir="${IPMI_TEST_LOG_DIR:-/var/log/ipmi-tests}"
-declare test_modules_dir="${IPMI_TEST_MODULES_DIR:-$script_dir/ipmi-test-modules}"
+declare script_path="$(readlink -f "$0")"
+
+# Determine test modules directory based on installation location
+# If installed via RPM to /usr/local/bin, use /usr/local/libexec/ipmi-test-harness
+# Otherwise, use local development path
+declare test_modules_dir=""
+if [[ "$script_path" == "/usr/local/bin/ipmi-test-harness" ]]; then
+	test_modules_dir="${IPMI_TEST_MODULES_DIR:-/usr/local/libexec/ipmi-test-harness}"
+else
+	test_modules_dir="${IPMI_TEST_MODULES_DIR:-$script_dir/ipmi-test-modules}"
+fi
+
+# Determine config file location based on installation
+# If installed via RPM, look in /etc/ipmi-test-harness/
+# Otherwise, use local development path
+declare config_file=""
+if [[ "$script_path" == "/usr/local/bin/ipmi-test-harness" ]]; then
+	config_file="${IPMI_TEST_CONFIG:-/etc/ipmi-test-harness/ipmi-test.conf}"
+else
+	config_file="${IPMI_TEST_CONFIG:-$script_dir/ipmi-test.conf}"
+fi
+
+declare log_dir="${IPMI_TEST_LOG_DIR:-$HOME/.local/share/ipmi-tests/logs}"
 declare -i verbose=0
 declare -i dry_run=0
 declare -i fail_fast=0
@@ -29,6 +49,9 @@ declare test_suite="all"
 declare bmc_host=""
 declare bmc_user=""
 declare bmc_pass=""
+declare bmc_interface="lanplus"
+declare -i local_mode=0
+declare -i allow_destructive=0
 declare -a test_modules=()
 declare -a enabled_modules=()
 declare -i total_tests=0
@@ -48,15 +71,18 @@ power control, event logging, and authentication across diverse BMC implementati
 Options:
   -h, --help              Show this help message
   -c, --config FILE       Configuration file (default: ipmi-test.conf)
-  -H, --host HOST         BMC hostname or IP address
-  -U, --user USER         BMC username
-  -P, --pass PASS         BMC password
+  -H, --host HOST         BMC hostname or IP address (omit for local mode)
+  -U, --user USER         BMC username (not needed in local mode)
+  -P, --pass PASS         BMC password (not needed in local mode)
+  -I, --interface INTF    IPMI interface: lanplus|lan|open (default: lanplus, open for local)
+  -L, --local             Local mode: test local BMC using -I open (no host/user/pass needed)
   -m, --module MODULE      Run specific test module (sensors|chassis|sel|auth|all)
-  -l, --log-dir DIR       Log directory (default: /var/log/ipmi-tests)
+  -l, --log-dir DIR       Log directory (default: ~/.local/share/ipmi-tests/logs)
   -v, --verbose           Verbose output
   -d, --dry-run           Dry run mode (show what would be executed)
   -f, --fail-fast         Stop on first test failure
   -s, --suite SUITE       Test suite name (default: all)
+  -D, --allow-destructive Allow destructive tests (power cycle, reset, etc.)
 
 Test Modules:
   sensors    - Sensor monitoring and reading tests
@@ -66,10 +92,13 @@ Test Modules:
   all        - Run all test modules (default)
 
 Examples:
-  # Run all tests with default config
-  $(basename "$0")
+  # Run all tests on local BMC
+  $(basename "$0") -L
 
-  # Run specific module with custom host
+  # Run specific module on local BMC
+  $(basename "$0") -L -m sensors
+
+  # Run tests against remote BMC
   $(basename "$0") -H 192.168.1.100 -U admin -P password -m sensors
 
   # Verbose dry-run to see what would be tested
@@ -178,11 +207,12 @@ load_config() {
 		value="${value%\'}"
 		
 		case "$key" in
-			BMC_HOST)	[[ -z "$bmc_host" ]] && bmc_host="$value" ;;
-			BMC_USER)	[[ -z "$bmc_user" ]] && bmc_user="$value" ;;
-			BMC_PASS)	[[ -z "$bmc_pass" ]] && bmc_pass="$value" ;;
-			VERBOSE)	((verbose == 0)) && verbose="$value" ;;
-			DRY_RUN)	((dry_run == 0)) && dry_run="$value" ;;
+			BMC_HOST)		[[ -z "$bmc_host" ]] && bmc_host="$value" ;;
+			BMC_USER)		[[ -z "$bmc_user" ]] && bmc_user="$value" ;;
+			BMC_PASS)		[[ -z "$bmc_pass" ]] && bmc_pass="$value" ;;
+			BMC_INTERFACE)	[[ -z "$bmc_interface" || "$bmc_interface" == "lanplus" ]] && bmc_interface="$value" ;;
+			VERBOSE)		((verbose == 0)) && verbose="$value" ;;
+			DRY_RUN)		((dry_run == 0)) && dry_run="$value" ;;
 		esac
 	done < "$config_file"
 }
@@ -282,6 +312,9 @@ run_test_module() {
 			export BMC_HOST="$bmc_host"
 			export BMC_USER="$bmc_user"
 			export BMC_PASS="$bmc_pass"
+			export BMC_INTERFACE="$bmc_interface"
+			export LOCAL_MODE="$local_mode"
+			export ALLOW_DESTRUCTIVE="$allow_destructive"
 			export VERBOSE="$verbose"
 			export DRY_RUN="$dry_run"
 			export LOG_FILE="$log_file"
@@ -348,7 +381,7 @@ main() {
 	local opt
 
 	# Parse command-line arguments
-	while getopts "hc:H:U:P:m:l:vdfs:" opt; do
+	while getopts "hc:H:U:P:I:Lm:l:vdfs:D" opt; do
 		case "$opt" in
 			h)
 				usage
@@ -365,6 +398,13 @@ main() {
 				;;
 			P)
 				bmc_pass="$OPTARG"
+				;;
+			I)
+				bmc_interface="$OPTARG"
+				;;
+			L)
+				local_mode=1
+				bmc_interface="open"
 				;;
 			m)
 				test_suite="$OPTARG"
@@ -383,6 +423,9 @@ main() {
 				;;
 			s)
 				test_suite="$OPTARG"
+				;;
+			D)
+				allow_destructive=1
 				;;
 			\?)
 				exitme 1 "Invalid option: -$OPTARG"
@@ -409,12 +452,20 @@ main() {
 	setup_logging
 
 	# Validate BMC connection parameters
-	[[ -z "$bmc_host" ]] && exitme 1 "BMC host not specified (use -H or config file)"
-	[[ -z "$bmc_user" ]] && exitme 1 "BMC user not specified (use -U or config file)"
-	[[ -z "$bmc_pass" ]] && exitme 1 "BMC password not specified (use -P or config file)"
+	if ((local_mode == 0)); then
+		[[ -z "$bmc_host" ]] && exitme 1 "BMC host not specified (use -H or config file, or -L for local mode)"
+		[[ -z "$bmc_user" ]] && exitme 1 "BMC user not specified (use -U or config file, or -L for local mode)"
+		[[ -z "$bmc_pass" ]] && exitme 1 "BMC password not specified (use -P or config file, or -L for local mode)"
+		log_message "INFO" "BMC Host: $bmc_host"
+		log_message "INFO" "BMC User: $bmc_user"
+	else
+		log_message "INFO" "Local Mode: Testing local BMC"
+		bmc_host="local"
+		bmc_user=""
+		bmc_pass=""
+	fi
 
-	log_message "INFO" "BMC Host: $bmc_host"
-	log_message "INFO" "BMC User: $bmc_user"
+	log_message "INFO" "BMC Interface: $bmc_interface"
 	log_message "INFO" "Test Suite: $test_suite"
 	log_message "INFO" "Verbose: $verbose"
 	log_message "INFO" "Dry Run: $dry_run"
