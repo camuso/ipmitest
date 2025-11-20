@@ -1,0 +1,317 @@
+#!/bin/bash
+#
+# ipmi-build-test-harness - Build script to package IPMI test harness into RPM
+#
+# Creates an RPM package from the IPMI test harness repository
+#
+
+#######################################
+# Script-Level Variables
+#######################################
+declare script_dir="$(dirname "$(readlink -f "$0")")"
+declare repo_dir="$script_dir"
+declare spec_file="$repo_dir/ipmi-test-harness.spec"
+declare rpmbuild_dir="$repo_dir/rpmbuild"
+declare -i verbose=0
+declare -i clean_build=0
+declare -i keep_build=0
+
+declare usagestr="$(
+cat <<EOF
+$(basename "$0") [-h|--help] [OPTIONS]
+
+Build script to package the IPMI test harness repository into an RPM package.
+Built RPM packages are always preserved in rpmbuild/RPMS/ and rpmbuild/SRPMS/.
+
+Options:
+  -h, --help       Show this help message
+  -v, --verbose    Verbose output
+  -c, --clean      Clean all build artifacts before building
+  -k, --keep       Keep all intermediate build artifacts (BUILD, SOURCES, etc.)
+
+Examples:
+  # Build RPM package (default: cleans intermediate files, keeps RPMs)
+  $(basename "$0")
+
+  # Clean build with verbose output
+  $(basename "$0") -c -v
+
+  # Build and keep all intermediate files
+  $(basename "$0") -k
+
+EOF
+)"
+
+#######################################
+# Functions
+#######################################
+
+#** usage: print usage information
+#*
+usage() {
+	echo -e "$usagestr"
+}
+
+#** exitme: exit with code and optional message
+#*
+# Arguments
+#   $1 - exit code
+#   $2 - optional message
+#*
+exitme() {
+	local -i code="$1"
+	local msg="$2"
+
+	((code == 0)) && exit "$code"
+	[[ -n "$msg" ]] && echo -e "$msg" >&2
+	usage
+	exit "$code"
+}
+
+#** control_c: control-c trap
+#*
+control_c() {
+	echo -e "\nCtrl-c detected\nCleaning up and exiting."
+	exitme 130
+}
+
+#** check_requirements: check that required tools are available
+#*
+check_requirements() {
+	local missing_tools=()
+	local tool
+
+	# Check for rpmbuild
+	command -v rpmbuild >/dev/null 2>&1 || missing_tools+=("rpmbuild")
+
+	# Check for tar
+	command -v tar >/dev/null 2>&1 || missing_tools+=("tar")
+
+	# Check for spec file
+	[[ -f "$spec_file" ]] || {
+		echo "Error: Spec file not found: $spec_file" >&2
+		exitme 1
+	}
+
+	# Check for rpmbuild directory structure
+	[[ -d "$rpmbuild_dir" ]] || {
+		echo "Error: rpmbuild directory not found: $rpmbuild_dir" >&2
+		echo "Please create the rpmbuild directory structure first" >&2
+		exitme 1
+	}
+
+	# Report missing tools
+	(( ${#missing_tools[@]} > 0 )) && {
+		echo "Error: Missing required tools: ${missing_tools[*]}" >&2
+		echo "Please install: rpm-build" >&2
+		exitme 1
+	}
+
+	((verbose > 0)) && echo "All requirements validated"
+}
+
+#** clean_build_artifacts: clean build artifacts but keep directory structure
+#*
+# Arguments
+#   $1 - clean_rpms (optional): if "all", also clean RPMS and SRPMS directories
+#*
+clean_build_artifacts() {
+	local clean_rpms="${1:-}"
+
+	((verbose > 0)) && echo "Cleaning build artifacts..."
+
+	# Clean BUILD directory
+	[[ -d "$rpmbuild_dir/BUILD" ]] && {
+		rm -rf "$rpmbuild_dir/BUILD"/*
+		((verbose > 0)) && echo "Cleaned BUILD directory"
+	}
+
+	# Clean BUILDROOT directory
+	[[ -d "$rpmbuild_dir/BUILDROOT" ]] && {
+		rm -rf "$rpmbuild_dir/BUILDROOT"/*
+		((verbose > 0)) && echo "Cleaned BUILDROOT directory"
+	}
+
+	# Clean SOURCES directory (but keep directory)
+	[[ -d "$rpmbuild_dir/SOURCES" ]] && {
+		rm -f "$rpmbuild_dir/SOURCES"/*
+		((verbose > 0)) && echo "Cleaned SOURCES directory"
+	}
+
+	# Clean RPMS and SRPMS only if explicitly requested (e.g., with -c flag)
+	if [[ "$clean_rpms" == "all" ]]; then
+		[[ -d "$rpmbuild_dir/RPMS" ]] && {
+			rm -rf "$rpmbuild_dir/RPMS"/*
+			((verbose > 0)) && echo "Cleaned RPMS directory"
+		}
+
+		[[ -d "$rpmbuild_dir/SRPMS" ]] && {
+			rm -rf "$rpmbuild_dir/SRPMS"/*
+			((verbose > 0)) && echo "Cleaned SRPMS directory"
+		}
+	else
+		((verbose > 0)) && echo "Preserved RPMS and SRPMS directories"
+	fi
+}
+
+#** ensure_build_dirs: ensure all required build directories exist
+#*
+ensure_build_dirs() {
+	mkdir -p "$rpmbuild_dir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
+
+	((verbose > 0)) && echo "Ensured RPM build directories exist"
+}
+
+#** create_source_tarball: create source tarball for RPM build
+#*
+create_source_tarball() {
+	local tarball_name="ipmi-test-harness.tar.gz"
+	local tarball_path="$rpmbuild_dir/SOURCES/$tarball_name"
+	local parent_dir="$(dirname "$repo_dir")"
+	local dir_name="$(basename "$repo_dir")"
+
+	((verbose > 0)) && echo "Creating source tarball: $tarball_path"
+
+	# Create tarball excluding build artifacts
+	# Tar from parent directory to include proper directory structure
+	tar czf "$tarball_path" \
+		-C "$parent_dir" \
+		--exclude="$dir_name/rpmbuild" \
+		--exclude="$dir_name/.git" \
+		--exclude="$dir_name/.gitignore" \
+		--exclude="$dir_name/*.rpm" \
+		--exclude="$dir_name/*.tar.gz" \
+		--transform "s,^$dir_name,ipmi-test-harness," \
+		"$dir_name" || {
+		echo "Error: Failed to create source tarball" >&2
+		exitme 1
+	}
+
+	((verbose > 0)) && echo "Source tarball created successfully"
+}
+
+#** copy_spec_file: copy spec file to RPM build directory
+#*
+copy_spec_file() {
+	cp "$spec_file" "$rpmbuild_dir/SPECS/" || {
+		echo "Error: Failed to copy spec file" >&2
+		exitme 1
+	}
+
+	((verbose > 0)) && echo "Spec file copied to build directory"
+}
+
+#** build_rpm: build RPM package using rpmbuild
+#*
+build_rpm() {
+	local spec_name="$(basename "$spec_file")"
+
+	((verbose > 0)) && echo "Building RPM package..."
+
+	rpmbuild --define "_topdir $rpmbuild_dir" \
+		-ba "$rpmbuild_dir/SPECS/$spec_name" || {
+		echo "Error: RPM build failed" >&2
+		exitme 1
+	}
+
+	((verbose > 0)) && echo "RPM package built successfully"
+}
+
+#** print_build_summary: print build summary with package locations
+#*
+print_build_summary() {
+	local rpms_dir="$rpmbuild_dir/RPMS"
+	local srpms_dir="$rpmbuild_dir/SRPMS"
+
+	echo ""
+	echo "=========================================="
+	echo "RPM Build Summary"
+	echo "=========================================="
+	echo "RPM build directory: $rpmbuild_dir"
+	echo "RPM packages: $rpms_dir"
+	echo "Source RPM: $srpms_dir"
+	echo ""
+	echo "Built packages:"
+	find "$rpms_dir" -name "*.rpm" -type f 2>/dev/null | while read -r pkg; do
+		echo "  $(basename "$pkg")"
+	done
+	echo "=========================================="
+}
+
+#** cleanup_build_artifacts: cleanup intermediate build artifacts
+#*
+# Note: Always keeps built RPM packages, only cleans intermediate files
+#*
+cleanup_build_artifacts() {
+	((keep_build == 0)) && {
+		((verbose > 0)) && echo "Cleaning intermediate build artifacts..."
+		clean_build_artifacts
+	} || {
+		((verbose > 0)) && echo "Keeping all build artifacts"
+	}
+}
+
+#** main: main function
+#*
+main() {
+	trap control_c SIGINT
+
+	local opt
+
+	# Parse command-line arguments
+	while getopts "hvck" opt; do
+		case "$opt" in
+			h)
+				usage
+				exit 0
+				;;
+			v)
+				((++verbose))
+				;;
+			c)
+				clean_build=1
+				;;
+			k)
+				keep_build=1
+				;;
+			\?)
+				exitme 1 "Invalid option: -$OPTARG"
+				;;
+		esac
+	done
+
+	# Check for help as positional argument
+	[[ "$1" == "help" ]] || [[ "$1" == "--help" ]] && {
+		usage
+		exit 0
+	}
+
+	# Check requirements
+	check_requirements
+
+	# Ensure build directories exist
+	ensure_build_dirs
+
+	# Clean build artifacts if requested (including old RPMs)
+	((clean_build > 0)) && clean_build_artifacts "all"
+
+	# Create source tarball
+	create_source_tarball
+
+	# Copy spec file
+	copy_spec_file
+
+	# Build RPM
+	build_rpm
+
+	# Print summary
+	print_build_summary
+
+	# Cleanup if not keeping build artifacts
+	cleanup_build_artifacts
+
+	exit 0
+}
+
+main "$@"
+
