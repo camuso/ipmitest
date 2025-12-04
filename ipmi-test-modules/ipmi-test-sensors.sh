@@ -178,6 +178,12 @@ test_sensor_get() {
 	cmd_output=$(run_ipmi_cmd sensor get "$sensor_name" 2>&1)
 	local -i status=$?
 
+	# Detect platforms where the sensor simply does not exist
+	if echo "$cmd_output" | grep -qi "not found\|no such sensor"; then
+		log_test "$test_name" "SKIP" "[NA] Sensor \"$sensor_name\" not detected on this platform"
+		return 0
+	fi
+
 	if ((status == 0)); then
 		if echo "$cmd_output" | grep -q "Sensor Reading"; then
 			log_test "$test_name" "PASS" "Successfully read sensor: $sensor_name"
@@ -208,11 +214,16 @@ test_sensor_thresholds() {
 	cmd_output=$(run_ipmi_cmd sensor thresh "$sensor_name" get 2>&1)
 	local -i status=$?
 
+	if echo "$cmd_output" | grep -qi "not found\|no such sensor"; then
+		log_test "$test_name" "SKIP" "[NA] Sensor \"$sensor_name\" not detected on this platform"
+		return 0
+	fi
+
 	if ((status == 0)); then
 		if echo "$cmd_output" | grep -qE "(Lower|Upper|Critical)"; then
 			log_test "$test_name" "PASS" "Successfully retrieved thresholds"
 		else
-			log_test "$test_name" "SKIP" "Sensor may not support thresholds"
+			log_test "$test_name" "SKIP" "Sensor may not expose threshold data"
 		fi
 	else
 		log_test "$test_name" "SKIP" "Threshold command not supported: $cmd_output"
