@@ -93,11 +93,14 @@ check_requirements() {
 		exitme 1
 	}
 
-	# Check for rpmbuild directory structure
+	# Create rpmbuild directory structure if it doesn't exist
 	[[ -d "$rpmbuild_dir" ]] || {
-		echo "Error: rpmbuild directory not found: $rpmbuild_dir" >&2
-		echo "Please create the rpmbuild directory structure first" >&2
-		exitme 1
+		((verbose > 0)) && echo "Creating rpmbuild directory structure..."
+		mkdir -p "$rpmbuild_dir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT} || {
+			echo "Error: Failed to create rpmbuild directory: $rpmbuild_dir" >&2
+			exitme 1
+		}
+		((verbose > 0)) && echo "Created rpmbuild directory structure"
 	}
 
 	# Report missing tools
