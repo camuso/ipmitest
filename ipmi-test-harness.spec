@@ -1,6 +1,6 @@
 Name:           ipmi-test-harness
 Version:        1.0
-Release:        5%{?dist}
+Release:        9%{?dist}
 Summary:        Comprehensive IPMI test harness for BMC validation
 
 License:        GPLv3+
@@ -63,6 +63,18 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
+* %(date "+%a %b %d %Y") Your Name <your.email@example.com> - 1.0-9
+- Sensor tests now log [NA] clearly when a sensor is not present
+
+* %(date "+%a %b %d %Y") Your Name <your.email@example.com> - 1.0-8
+- Sensor threshold tests now report [NA] when sensors are not present
+
+* %(date "+%a %b %d %Y") Your Name <your.email@example.com> - 1.0-7
+- Improved sensor threshold reporting; now logs FAIL when sensors are missing
+
+* %(date "+%a %b %d %Y") Your Name <your.email@example.com> - 1.0-6
+- Fixed SEL post-clear verification to avoid bash arithmetic errors
+
 * %(date "+%a %b %d %Y") Your Name <your.email@example.com> - 1.0-5
 - Fixed auth module to handle local mode properly
 - Skip network-only tests when running in local mode
