@@ -265,8 +265,14 @@ test_sel_clear() {
 		log_test "$test_name" "PASS" "SEL clear command accepted"
 		sleep 2
 		# Verify SEL was cleared
-		local entry_count
-		entry_count=$(run_ipmi_cmd sel list 2>&1 | grep -c "^[0-9a-fA-F]" || echo "0")
+		local -i entry_count=0
+		local sel_list_output
+		sel_list_output=$(run_ipmi_cmd sel list 2>&1)
+		if (( $? == 0 )); then
+			entry_count=$(echo "$sel_list_output" | grep -c "^[0-9a-fA-F]" 2>/dev/null) || entry_count=0
+			[[ "$entry_count" =~ ^[0-9]+$ ]] || entry_count=0
+		fi
+
 		if ((entry_count == 0)); then
 			log_test "$test_name" "PASS" "SEL successfully cleared"
 		else
